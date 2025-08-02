@@ -1,149 +1,147 @@
 #!/bin/bash
 
 # ==============================================================================
-# VPN Router Script v2.1 - Compartilhamento de Conexão VPN
+# VPN Router Script - Compartilhamento de Conexão VPN v2.2
 # ==============================================================================
-# Autor: Krisofferson Marini
+# Autor: Krisofferson Marini (com melhorias sugeridas)
 # e-mail: ksmarini@gmail.com
-# Versão: 2.1
+# Versão: 2.2
 # Licença: MIT
-# Descrição: Script para compartilhar conexão VPN. Carrega as interfaces de
-#            um arquivo .env localizado na mesma pasta.
+# Descrição: Script para compartilhar conexão VPN entre dispositivos na rede local,
+#            com configurações externas e feedback visual colorido.
 # ==============================================================================
 
-# Modo estrito: sai em caso de erro, variável não definida ou erro em pipe.
-set -euo pipefail
+set -euo pipefail # Modo strict: sai em caso de erro, variável não definida ou erro em pipe
 
-# ==============================================================================
-# CARREGAR CONFIGURAÇÕES EXTERNAS
-# ==============================================================================
+# --- DEFINIÇÃO DE CORES E FUNÇÕES DE MENSAGEM ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
-# Define o caminho absoluto para o diretório do script
-# Isso garante que o .env seja encontrado independentemente de onde o script é chamado
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-ENV_FILE="$SCRIPT_DIR/.env"
-
-# Verifica se o arquivo .env existe
-if [ ! -f "$ENV_FILE" ]; then
-  echo "ERRO: Arquivo de configuração '$ENV_FILE' não encontrado." >&2
-  echo "Por favor, crie um arquivo .env com as variáveis VPN_INTERFACE e LAN_INTERFACE." >&2
-  exit 1
-fi
-
-# Carrega as variáveis do arquivo .env
-# O comando 'source' (ou '.') executa o arquivo no shell atual, importando suas variáveis
-source "$ENV_FILE"
-
-# Valida se as variáveis foram carregadas corretamente do .env
-if [ -z "${VPN_INTERFACE:-}" ] || [ -z "${LAN_INTERFACE:-}" ]; then
-  echo "ERRO: As variáveis VPN_INTERFACE e/ou LAN_INTERFACE não estão definidas no arquivo .env." >&2
-  echo "Verifique o conteúdo de '$ENV_FILE'." >&2
-  exit 1
-fi
-
-# ==============================================================================
-# FUNÇÕES AUXILIARES
-# ==============================================================================
-
-# Exibe como usar o script
-usage() {
-  echo "Uso: sudo $0 [enable|disable|status]"
-  echo "  enable : Ativa o roteamento da LAN para a VPN."
-  echo "  disable: Desativa o roteamento."
-  echo "  status : Verifica o status atual do roteamento."
-  exit 1
+msg_info() {
+  echo -e "${BLUE}[INFO]${NC} $1"
+}
+msg_success() {
+  echo -e "${GREEN}[SUCESSO]${NC} $1"
+}
+msg_error() {
+  echo -e "${RED}[ERRO]${NC} $1" >&2
+}
+msg_warn() {
+  echo -e "${YELLOW}[AVISO]${NC} $1"
 }
 
-# Verifica se o script está sendo executado como root
-check_privileges() {
-  if [ "$(id -u)" -ne 0 ]; then
-    echo "ERRO: Este script precisa ser executado com privilégios de root (use sudo)." >&2
+# --- CARREGAR CONFIGURAÇÕES ---
+load_config() {
+  msg_info "Carregando configurações..."
+  if [ -f ".env" ]; then
+    export $(grep -v '^#' .env | xargs)
+    msg_success "Arquivo .env carregado."
+  else
+    msg_error "Arquivo de configuração .env não encontrado. Crie um com as variáveis LAN_IF e VPN_IF."
+    exit 1
+  fi
+
+  if [ -z "${LAN_IF:-}" ] || [ -z "${VPN_IF:-}" ]; then
+    msg_error "As variáveis LAN_IF e VPN_IF devem estar definidas no arquivo .env."
     exit 1
   fi
 }
 
-# Ativa o roteamento
+# --- VERIFICAR PRIVILÉGIOS ---
+check_privileges() {
+  if [ "$(id -u)" -ne 0 ]; then
+    msg_error "Este script precisa ser executado como root. Use 'sudo'."
+    exit 1
+  fi
+}
+
+# --- HABILITAR ROTEAMENTO ---
 enable_routing() {
-  echo "Ativando o roteamento da VPN..."
-  echo "LAN ($LAN_INTERFACE) -> VPN ($VPN_INTERFACE)"
+  msg_info "Ativando o roteamento..."
+
+  # Ativa o encaminhamento de IP
+  # sysctl -w net.ipv4.ip_forward=1 # Forma alternativa
+  echo 1 >/proc/sys/net/ipv4/ip_forward
+  msg_info "Encaminhamento de IP ativado."
 
   # Limpa regras anteriores para evitar duplicação (idempotência)
-  disable_routing >/dev/null 2>&1
+  msg_warn "Limpando regras de iptables existentes para este script..."
+  iptables -t nat -D POSTROUTING -o "$VPN_IF" -j MASQUERADE 2>/dev/null || true
+  iptables -D FORWARD -i "$LAN_IF" -o "$VPN_IF" -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -i "$VPN_IF" -o "$LAN_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 
-  # Ativa o encaminhamento de IP no kernel
-  echo 1 >/proc/sys/net/ipv4/ip_forward
+  # Configura as regras de NAT e encaminhamento
+  msg_info "Configurando regras de NAT e encaminhamento no iptables..."
+  iptables -t nat -A POSTROUTING -o "$VPN_IF" -j MASQUERADE
+  iptables -A FORWARD -i "$LAN_IF" -o "$VPN_IF" -j ACCEPT
+  iptables -A FORWARD -i "$VPN_IF" -o "$LAN_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT
 
-  # Adiciona as regras de firewall para NAT (mascaramento)
-  # Permite que pacotes da LAN saiam pela interface da VPN com o IP dela
-  iptables -t nat -A POSTROUTING -o "$VPN_INTERFACE" -j MASQUERADE
-  # Permite o tráfego de volta da VPN para a LAN
-  iptables -A FORWARD -i "$VPN_INTERFACE" -o "$LAN_INTERFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
-  # Permite o tráfego da LAN para a VPN
-  iptables -A FORWARD -i "$LAN_INTERFACE" -o "$VPN_INTERFACE" -j ACCEPT
-
-  echo "Roteamento ativado com sucesso."
+  msg_success "Roteamento da LAN ($LAN_IF) para a VPN ($VPN_IF) ativado."
 }
 
-# Desativa o roteamento
+# --- DESABILITAR ROTEAMENTO ---
 disable_routing() {
-  echo "Desativando o roteamento da VPN..."
+  msg_info "Desativando o roteamento..."
 
-  # Remove as regras de firewall de forma segura
-  # O '-C' verifica se a regra existe antes de tentar deletar, evitando erros.
-  iptables -t nat -C POSTROUTING -o "$VPN_INTERFACE" -j MASQUERADE &>/dev/null &&
-    iptables -t nat -D POSTROUTING -o "$VPN_INTERFACE" -j MASQUERADE
-  iptables -C FORWARD -i "$VPN_INTERFACE" -o "$LAN_INTERFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT &>/dev/null &&
-    iptables -C FORWARD -i "$VPN_INTERFACE" -o "$LAN_INTERFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
-  iptables -C FORWARD -i "$LAN_INTERFACE" -o "$VPN_INTERFACE" -j ACCEPT &>/dev/null &&
-    iptables -C FORWARD -i "$LAN_INTERFACE" -o "$VPN_INTERFACE" -j ACCEPT
+  # Remove as regras de iptables
+  msg_info "Removendo regras de iptables..."
+  iptables -t nat -D POSTROUTING -o "$VPN_IF" -j MASQUERADE
+  iptables -D FORWARD -i "$LAN_IF" -o "$VPN_IF" -j ACCEPT
+  iptables -D FORWARD -i "$VPN_IF" -o "$LAN_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT
 
-  # Desativa o encaminhamento de IP no kernel (opcional, mas boa prática)
+  # Desativa o encaminhamento de IP (opcional, mais seguro)
   echo 0 >/proc/sys/net/ipv4/ip_forward
+  msg_info "Encaminhamento de IP desativado."
 
-  echo "Roteamento desativado."
+  msg_success "Roteamento desativado."
 }
 
-# Mostra o status atual
+# --- MOSTRAR STATUS ---
 show_status() {
-  echo "================== Status do Roteamento VPN =================="
-  echo "Interface da VPN: $VPN_INTERFACE"
-  echo "Interface da LAN: $LAN_INTERFACE"
-  echo ""
+  msg_info "Verificando status do roteamento..."
 
   local ip_forward
   ip_forward=$(cat /proc/sys/net/ipv4/ip_forward)
 
-  if [ "$ip_forward" -eq 1 ]; then
-    echo "Kernel IP Forwarding: ATIVADO"
+  if [ "$ip_forward" = "1" ]; then
+    msg_info "Encaminhamento de IP: ${GREEN}ATIVO${NC}"
   else
-    echo "Kernel IP Forwarding: DESATIVADO"
+    msg_info "Encaminhamento de IP: ${RED}INATIVO${NC}"
   fi
 
-  echo ""
-  echo "Regras de Firewall (iptables) relevantes:"
-  # O comando grep retorna um status de erro se não encontrar nada, o '|| true' evita que o 'set -e' pare o script
-  (iptables -t nat -L POSTROUTING -n -v | grep "MASQUERADE.*$VPN_INTERFACE" &&
-    iptables -L FORWARD -n -v | grep "$LAN_INTERFACE.*$VPN_INTERFACE") || true
-
-  if iptables -t nat -C POSTROUTING -o "$VPN_INTERFACE" -j MASQUERADE &>/dev/null; then
-    echo -e "\nResultado: O roteamento parece estar ATIVO."
+  msg_info "Verificando regras de iptables para $VPN_IF e $LAN_IF:"
+  if iptables -t nat -C POSTROUTING -o "$VPN_IF" -j MASQUERADE &>/dev/null; then
+    echo -e " -> Regra de NAT (POSTROUTING): ${GREEN}ATIVO${NC}"
   else
-    echo -e "\nResultado: O roteamento parece estar INATIVO."
+    echo -e " -> Regra de NAT (POSTROUTING): ${RED}INATIVO${NC}"
   fi
-  echo "=============================================================="
+
+  if iptables -C FORWARD -i "$LAN_IF" -o "$VPN_IF" -j ACCEPT &>/dev/null; then
+    echo -e " -> Regra de FORWARD (LAN -> VPN): ${GREEN}ATIVO${NC}"
+  else
+    echo -e " -> Regra de FORWARD (LAN -> VPN): ${RED}INATIVO${NC}"
+  fi
+}
+
+# --- MENSAGEM DE USO ---
+usage() {
+  echo -e "${BLUE}Uso:${NC} sudo $0 {enable|disable|status}"
+  echo -e "  ${YELLOW}enable${NC}   : Ativa o compartilhamento da conexão VPN."
+  echo -e "  ${YELLOW}disable${NC}  : Desativa o compartilhamento."
+  echo -e "  ${YELLOW}status${NC}   : Mostra o status atual do roteamento."
 }
 
 # ==============================================================================
 # FUNÇÃO PRINCIPAL
 # ==============================================================================
-
 main() {
-  # Verifica privilégios
   check_privileges
+  load_config
 
-  # Processa argumentos da linha de comando
-  # Se nenhum argumento for passado, o padrão é 'status'
-  case "${1:-status}" in
+  case "${1:-status}" in # Define 'status' como padrão se nenhum argumento for passado
   enable)
     enable_routing
     ;;
@@ -155,9 +153,10 @@ main() {
     ;;
   *)
     usage
+    exit 1
     ;;
   esac
 }
 
-# Executa a função principal com todos os argumentos passados para o script
+# Executa a função principal com os argumentos passados para o script
 main "$@"
