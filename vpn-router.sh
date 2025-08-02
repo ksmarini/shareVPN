@@ -13,11 +13,11 @@
 set -euo pipefail # Modo strict: sai em caso de erro, variável não definida ou pipe failure
 
 # Cores para logging
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[1;33m'
-readonly BLUE='\033[0;34m'
-readonly NC='\033[0m' # No Color
+readonly RED=\'\\033[031m\'
+readonly GREEN=\'\\033[032m\'
+readonly YELLOW=\'\\033[133m\'
+readonly BLUE=\'\\033[034m\'
+readonly NC=\'\\033[0m\' # No Color
 
 # Configurações padrão
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -73,12 +73,12 @@ check_privileges() {
 
     # Detecta o grupo administrativo baseado na distribuição
     if command -v pacman >/dev/null 2>&1; then
-      # Arch Linux usa o grupo 'wheel'
-      log_error "No Arch Linux, adicione seu usuário ao grupo 'wheel' e use 'sudo'."
-      log_error "Comando: sudo usermod -aG wheel \$USER"
+      # Arch Linux usa o grupo \'wheel\'
+      log_error "No Arch Linux, adicione seu usuário ao grupo \'wheel\' e use \'sudo\'."
+      log_error "Comando: sudo usermod -aG wheel \\\$USER"
     else
-      # Debian/Ubuntu e outras distribuições usam 'sudo'
-      log_error "Adicione seu usuário ao grupo 'sudo' se necessário."
+      # Debian/Ubuntu e outras distribuições usam \'sudo\'
+      log_error "Adicione seu usuário ao grupo \'sudo\' se necessário."
     fi
 
     log_error "Uso: sudo $0 [enable|disable|status]"
@@ -91,17 +91,17 @@ check_interfaces() {
   log_debug "Verificando interfaces de rede..."
 
   if ! ip link show "$LAN_INTERFACE" >/dev/null 2>&1; then
-    log_error "Interface LAN '$LAN_INTERFACE' não encontrada."
+    log_error "Interface LAN \'$LAN_INTERFACE\' não encontrada."
     log_error "Interfaces disponíveis:"
-    ip link show | grep -E '^[0-9]+:' | awk -F': ' '{print "  - " $2}' | sed 's/@.*//'
+    ip link show | grep -E \'^[0-9]+:\' | awk -F\': \' \'{print "  - " $2}\' | sed \'s/@.*//\'
     return 1
   fi
 
   if ! ip link show "$VPN_INTERFACE" >/dev/null 2>&1; then
-    log_error "Interface VPN '$VPN_INTERFACE' não encontrada."
+    log_error "Interface VPN \'$VPN_INTERFACE\' não encontrada."
     log_error "Certifique-se de que a VPN está conectada."
     log_error "Interfaces disponíveis:"
-    ip link show | grep -E '^[0-9]+:' | awk -F': ' '{print "  - " $2}' | sed 's/@.*//'
+    ip link show | grep -E \'^[0-9]+:\' | awk -F\': \' \'{print "  - " $2}\' | sed \'s/@.*//\'
     return 1
   fi
 
@@ -130,11 +130,16 @@ rule_exists() {
   local chain="$2"
   local rule="$3"
 
+  # Tenta verificar a regra. O '|| true' garante que o 'set -e' não saia se a regra não existir.
   if [[ "$table" == "filter" ]]; then
-    iptables -C "$chain" $rule 2>/dev/null
+    iptables -C "$chain" $rule 2>/dev/null || true
   else
-    iptables -t "$table" -C "$chain" $rule 2>/dev/null
+    iptables -t "$table" -C "$chain" $rule 2>/dev/null || true
   fi
+
+  # Retorna o status da verificação (0 se a regra existe, 1 se não)
+  # O $? é o código de saída do último comando (iptables -C)
+  return $?
 }
 
 # Adiciona regra do iptables se não existir
@@ -220,14 +225,14 @@ show_status() {
   echo ""
   echo "Status das interfaces:"
   if ip link show "$LAN_INTERFACE" >/dev/null 2>&1; then
-    local lan_ip=$(ip addr show "$LAN_INTERFACE" | grep -oP 'inet \K[\d.]+' | head -1)
+    local lan_ip=$(ip addr show "$LAN_INTERFACE" | grep -oP \'inet \\K[\\d.]+\' | head -1)
     log_info "LAN ($LAN_INTERFACE): UP - IP: ${lan_ip:-N/A}"
   else
     log_error "LAN ($LAN_INTERFACE): NÃO ENCONTRADA"
   fi
 
   if ip link show "$VPN_INTERFACE" >/dev/null 2>&1; then
-    local vpn_ip=$(ip addr show "$VPN_INTERFACE" | grep -oP 'inet \K[\d.]+' | head -1)
+    local vpn_ip=$(ip addr show "$VPN_INTERFACE" | grep -oP \'inet \\K[\\d.]+\' | head -1)
     log_info "VPN ($VPN_INTERFACE): UP - IP: ${vpn_ip:-N/A}"
   else
     log_error "VPN ($VPN_INTERFACE): NÃO ENCONTRADA"
@@ -360,6 +365,7 @@ disable_routing() {
 # FUNÇÃO PRINCIPAL
 # ==============================================================================
 
+# A função principal agora recebe os argumentos diretamente
 main() {
   # Carrega configurações
   load_config
@@ -384,5 +390,5 @@ main() {
   esac
 }
 
-# Executa função principal com todos os argumentos
+# Executa a função principal com os argumentos passados para o script
 main "$@"
