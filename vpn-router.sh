@@ -1,380 +1,219 @@
 #!/bin/bash
-
 # ==============================================================================
 # VPN Router Script - Compartilhamento de Conexão VPN
 # ==============================================================================
-# Autor: Krisofferson Marini
-# e-mail: ksmarini@gmail.com
-# Versão: 2.0
-# Licença: MIT
-# Descrição: Script para compartilhar conexão VPN entre dispositivos na rede local
+# Autor:      Krisofferson Marini
+# e-mail:     ksmarini@gmail.com
+# Versão:     2.5
+# Licença:    MIT
+# Descrição:  Script para compartilhar uma conexão VPN (ex: tun0) com outros
+#             dispositivos em uma rede local (ex: eth0).
+#             Requer privilégios de root para manipular o roteamento e o firewall.
 # ==============================================================================
 
-set -euo pipefail # Modo strict: sai em caso de erro, variável não definida ou pipe failure
-
-# Cores para logging
-readonly RED=\'\\033[031m\'
-readonly GREEN=\'\\033[032m\'
-readonly YELLOW=\'\\033[133m\'
-readonly BLUE=\'\\033[034m\'
-readonly NC=\'\\033[0m\' # No Color
-
-# Configurações padrão
-readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly CONFIG_FILE="${SCRIPT_DIR}/.env"
-readonly BACKUP_FILE="/tmp/iptables_before_vpn_routing_$(date +%s).rules"
-
-# Variáveis de configuração (podem ser sobrescritas pelo .env)
-LAN_INTERFACE="${LAN_INTERFACE:-enp0s3}"
-VPN_INTERFACE="${VPN_INTERFACE:-tun0}"
-LOG_LEVEL="${LOG_LEVEL:-INFO}"
+# MODO STRICT: Sai imediatamente se um comando falhar (-e), se uma variável
+# não definida for usada (-u), ou se um comando em um pipe falhar (-o pipefail).
+set -euo pipefail
 
 # ==============================================================================
-# FUNÇÕES DE LOGGING
+# CONFIGURAÇÃO - MODIFIQUE ESTAS VARIÁVEIS
 # ==============================================================================
+# Para descobrir os nomes das suas interfaces, use o comando: ip addr
 
-log_info() {
-  [[ "$LOG_LEVEL" =~ ^(DEBUG|INFO)$ ]] && echo -e "${GREEN}[INFO]${NC} $1"
-}
+# Interface da sua VPN (geralmente 'tun0' para OpenVPN/WireGuard)
+VPN_IFACE="tunsnx"
 
-log_warn() {
-  [[ "$LOG_LEVEL" =~ ^(DEBUG|INFO|WARN)$ ]] && echo -e "${YELLOW}[WARN]${NC} $1"
-}
+# Interface da sua rede local (pode ser 'eth0', 'enp3s0', 'wlan0', etc.)
+LAN_IFACE="wlp0s20f3"
 
-log_error() {
-  echo -e "${RED}[ERROR]${NC} $1" >&2
-}
+# Sub-rede da sua rede local. O script tentará detectar automaticamente,
+# mas você pode definir manualmente se a detecção falhar.
+# Exemplo: LAN_SUBNET="192.168.1.0/24"
+LAN_SUBNET=""
 
-log_debug() {
-  [[ "$LOG_LEVEL" == "DEBUG" ]] && echo -e "${BLUE}[DEBUG]${NC} $1"
-}
+# ==============================================================================
+# VARIÁVEIS GLOBAIS (Não modificar)
+# ==============================================================================
+# Cores para o output
+C_RED='\033[0;31m'
+C_GREEN='\033[0;32m'
+C_YELLOW='\033[0;33m'
+C_BLUE='\033[0;34m'
+C_NC='\033[0m' # Sem Cor
 
 # ==============================================================================
 # FUNÇÕES AUXILIARES
 # ==============================================================================
 
-# Carrega configurações do arquivo .env se existir
-load_config() {
-  if [[ -f "$CONFIG_FILE" ]]; then
-    log_debug "Carregando configurações de $CONFIG_FILE"
-    # shellcheck source=/dev/null
-    source "$CONFIG_FILE"
-    log_info "Configurações carregadas do arquivo .env"
-  else
-    log_warn "Arquivo .env não encontrado. Usando configurações padrão."
-    log_info "Crie um arquivo .env no mesmo diretório do script para personalizar as configurações."
-  fi
+# Imprime mensagens de log com cores
+log() {
+  local color="$1"
+  local message="$2"
+  printf "${color}%s${C_NC}\n" "$message"
 }
 
-# Verifica se o script está sendo executado com privilégios adequados
+# Verifica se o script está sendo executado como root
 check_privileges() {
-  if [[ $EUID -ne 0 ]]; then
-    log_error "Este script deve ser executado com privilégios de root."
-
-    # Detecta o grupo administrativo baseado na distribuição
-    if command -v pacman >/dev/null 2>&1; then
-      # Arch Linux usa o grupo \'wheel\'
-      log_error "No Arch Linux, adicione seu usuário ao grupo \'wheel\' e use \'sudo\'."
-      log_error "Comando: sudo usermod -aG wheel \\\$USER"
-    else
-      # Debian/Ubuntu e outras distribuições usam \'sudo\'
-      log_error "Adicione seu usuário ao grupo \'sudo\' se necessário."
-    fi
-
-    log_error "Uso: sudo $0 [enable|disable|status]"
+  if [ "$(id -u)" -ne 0 ]; then
+    log "$C_RED" "ERRO: Este script precisa ser executado com privilégios de root (use sudo)."
     exit 1
   fi
 }
 
-# Verifica se as interfaces de rede existem
-check_interfaces() {
-  log_debug "Verificando interfaces de rede..."
-
-  if ! ip link show "$LAN_INTERFACE" >/dev/null 2>&1; then
-    log_error "Interface LAN \'$LAN_INTERFACE\' não encontrada."
-    log_error "Interfaces disponíveis:"
-    ip link show | grep -E \'^[0-9]+:\' | awk -F\': \' \'{print "  - " $2}\' | sed \'s/@.*//\'
-    return 1
-  fi
-
-  if ! ip link show "$VPN_INTERFACE" >/dev/null 2>&1; then
-    log_error "Interface VPN \'$VPN_INTERFACE\' não encontrada."
-    log_error "Certifique-se de que a VPN está conectada."
-    log_error "Interfaces disponíveis:"
-    ip link show | grep -E \'^[0-9]+:\' | awk -F\': \' \'{print "  - " $2}\' | sed \'s/@.*//\'
-    return 1
-  fi
-
-  log_debug "Interfaces verificadas com sucesso"
-}
-
-# Executa comando com tratamento de erro
-run_command() {
-  local cmd="$1"
-  local description="$2"
-
-  log_debug "Executando: $cmd"
-
-  if eval "$cmd" >/dev/null 2>&1; then
-    log_info "$description [OK]"
-    return 0
-  else
-    log_error "$description [FALHA]"
-    return 1
-  fi
-}
-
-# Verifica se uma regra do iptables existe
-rule_exists() {
-  local table="$1"
-  local chain="$2"
-  local rule="$3"
-
-  # Tenta verificar a regra. O '|| true' garante que o 'set -e' não saia se a regra não existir.
-  if [[ "$table" == "filter" ]]; then
-    iptables -C "$chain" $rule 2>/dev/null || true
-  else
-    iptables -t "$table" -C "$chain" $rule 2>/dev/null || true
-  fi
-
-  # Retorna o status da verificação (0 se a regra existe, 1 se não)
-  # O $? é o código de saída do último comando (iptables -C)
-  return $?
-}
-
-# Adiciona regra do iptables se não existir
-add_rule_if_not_exists() {
-  local table="$1"
-  local chain="$2"
-  local rule="$3"
-  local description="$4"
-
-  if rule_exists "$table" "$chain" "$rule"; then
-    log_info "$description [JÁ EXISTE]"
-  else
-    if [[ "$table" == "filter" ]]; then
-      if iptables -A "$chain" $rule; then
-        log_info "$description [ADICIONADA]"
-      else
-        log_error "$description [FALHA]"
-        return 1
-      fi
-    else
-      if iptables -t "$table" -A "$chain" $rule; then
-        log_info "$description [ADICIONADA]"
-      else
-        log_error "$description [FALHA]"
-        return 1
-      fi
+# Detecta a sub-rede da LAN se não estiver definida
+detect_subnet() {
+  if [ -z "$LAN_SUBNET" ]; then
+    log "$C_BLUE" "Tentando detectar a sub-rede para a interface ${LAN_IFACE}..."
+    # Usa `ip` para obter o endereço CIDR da interface e `grep` para filtrar a linha correta
+    LAN_SUBNET=$(ip -4 addr show "${LAN_IFACE}" | grep -oP 'inet \K[\d.]+\/\d+' | head -n 1)
+    if [ -z "$LAN_SUBNET" ]; then
+      log "$C_RED" "ERRO: Não foi possível detectar a sub-rede para ${LAN_IFACE}."
+      log "$C_YELLOW" "Por favor, defina a variável LAN_SUBNET manualmente no script."
+      exit 1
     fi
+    log "$C_GREEN" "Sub-rede detectada: ${LAN_SUBNET}"
   fi
+}
+
+# Exibe como usar o script
+usage() {
+  printf "Uso: %s [comando]\n\n" "$0"
+  printf "Comandos:\n"
+  printf "  ${C_GREEN}enable${C_NC}   - Ativa o roteamento da LAN para a VPN.\n"
+  printf "  ${C_RED}disable${C_NC}  - Desativa o roteamento e limpa as regras.\n"
+  printf "  ${C_YELLOW}status${C_NC}   - Mostra o estado atual do roteamento e das regras.\n"
+  exit 1
 }
 
 # ==============================================================================
 # FUNÇÕES PRINCIPAIS
 # ==============================================================================
 
-# Exibe informações de uso
-usage() {
-  cat <<EOF
-Uso: $0 [enable|disable|status]
-
-COMANDOS:
-  enable   - Ativa o roteamento da VPN e NAT
-  disable  - Desativa o roteamento da VPN e NAT
-  status   - Mostra o status atual do roteamento
-
-CONFIGURAÇÃO:
-  Crie um arquivo .env no mesmo diretório do script com as seguintes variáveis:
-  
-  LAN_INTERFACE=enp0s3     # Interface da rede local
-  VPN_INTERFACE=tun0       # Interface da VPN
-  LOG_LEVEL=INFO           # Nível de log (DEBUG, INFO, WARN, ERROR)
-
-EXEMPLOS:
-  sudo $0 enable           # Ativa o roteamento
-  sudo $0 disable          # Desativa o roteamento
-  sudo $0 status           # Verifica status
-
-Para descobrir suas interfaces de rede, use: ip a
-
-EOF
-  exit 1
-}
-
-# Mostra o status atual do roteamento
-show_status() {
-  echo "========================================"
-  echo "STATUS DO ROTEAMENTO VPN"
-  echo "========================================"
-
-  # Verifica IP forwarding
-  local ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo "0")
-  if [[ "$ip_forward" == "1" ]]; then
-    log_info "IP Forwarding: ATIVADO"
-  else
-    log_warn "IP Forwarding: DESATIVADO"
-  fi
-
-  # Verifica interfaces
-  echo ""
-  echo "Interfaces configuradas:"
-  echo "  LAN: $LAN_INTERFACE"
-  echo "  VPN: $VPN_INTERFACE"
-
-  echo ""
-  echo "Status das interfaces:"
-  if ip link show "$LAN_INTERFACE" >/dev/null 2>&1; then
-    local lan_ip=$(ip addr show "$LAN_INTERFACE" | grep -oP \'inet \\K[\\d.]+\' | head -1)
-    log_info "LAN ($LAN_INTERFACE): UP - IP: ${lan_ip:-N/A}"
-  else
-    log_error "LAN ($LAN_INTERFACE): NÃO ENCONTRADA"
-  fi
-
-  if ip link show "$VPN_INTERFACE" >/dev/null 2>&1; then
-    local vpn_ip=$(ip addr show "$VPN_INTERFACE" | grep -oP \'inet \\K[\\d.]+\' | head -1)
-    log_info "VPN ($VPN_INTERFACE): UP - IP: ${vpn_ip:-N/A}"
-  else
-    log_error "VPN ($VPN_INTERFACE): NÃO ENCONTRADA"
-  fi
-
-  # Verifica regras do iptables
-  echo ""
-  echo "Regras do iptables:"
-
-  if rule_exists "nat" "POSTROUTING" "-o $VPN_INTERFACE -j MASQUERADE"; then
-    log_info "Regra MASQUERADE: PRESENTE"
-  else
-    log_warn "Regra MASQUERADE: AUSENTE"
-  fi
-
-  if rule_exists "filter" "FORWARD" "-i $LAN_INTERFACE -o $VPN_INTERFACE -j ACCEPT"; then
-    log_info "Regra FORWARD (LAN→VPN): PRESENTE"
-  else
-    log_warn "Regra FORWARD (LAN→VPN): AUSENTE"
-  fi
-
-  if rule_exists "filter" "FORWARD" "-i $VPN_INTERFACE -o $LAN_INTERFACE -m state --state RELATED,ESTABLISHED -j ACCEPT"; then
-    log_info "Regra FORWARD (VPN→LAN): PRESENTE"
-  else
-    log_warn "Regra FORWARD (VPN→LAN): AUSENTE"
-  fi
-
-  echo "========================================"
-}
-
-# Ativa o roteamento da VPN
+# Ativa o roteamento e as regras de firewall
 enable_routing() {
-  echo "========================================"
-  echo "ATIVANDO ROTEAMENTO VPN"
-  echo "========================================"
-  echo "Interface LAN: $LAN_INTERFACE"
-  echo "Interface VPN: $VPN_INTERFACE"
-  echo "========================================"
+  log "$C_BLUE" "Ativando o compartilhamento de VPN..."
 
-  # Verifica interfaces antes de prosseguir
-  if ! check_interfaces; then
-    log_error "Falha na verificação das interfaces. Abortando."
-    return 1
+  # 1. Ativa o encaminhamento de IP no kernel
+  log "$C_BLUE" "[1/3] Ativando encaminhamento de IP (net.ipv4.ip_forward=1)..."
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+  # 2. Adiciona a regra de NAT (MASQUERADE)
+  # Esta regra faz com que o tráfego da LAN pareça vir da interface VPN
+  log "$C_BLUE" "[2/3] Adicionando regra de NAT (MASQUERADE) via iptables..."
+  # -C (check) verifica se a regra já existe para evitar duplicatas
+  if ! iptables -t nat -C POSTROUTING -o "${VPN_IFACE}" -j MASQUERADE &>/dev/null; then
+    iptables -t nat -A POSTROUTING -o "${VPN_IFACE}" -j MASQUERADE
+  else
+    log "$C_YELLOW" "A regra de MASQUERADE já existe. Nenhuma ação necessária."
   fi
 
-  # Habilita IP forwarding
-  log_info "Habilitando IP forwarding..."
-  if ! run_command "sysctl -w net.ipv4.ip_forward=1" "IP forwarding"; then
-    log_error "Falha ao habilitar IP forwarding"
-    return 1
+  # 3. Adiciona as regras de encaminhamento (FORWARD)
+  # Permite que pacotes da LAN sejam encaminhados para a VPN e vice-versa
+  log "$C_BLUE" "[3/3] Adicionando regras de encaminhamento (FORWARD) via iptables..."
+  # Regra para permitir o tráfego da LAN para a VPN
+  if ! iptables -C FORWARD -i "${LAN_IFACE}" -o "${VPN_IFACE}" -j ACCEPT &>/dev/null; then
+    iptables -A FORWARD -i "${LAN_IFACE}" -o "${VPN_IFACE}" -j ACCEPT
+  else
+    log "$C_YELLOW" "A regra de FORWARD (LAN -> VPN) já existe."
   fi
 
-  # Salva regras atuais do iptables
-  log_info "Salvando regras atuais do iptables..."
-  if ! iptables-save >"$BACKUP_FILE"; then
-    log_error "Falha ao salvar regras do iptables"
-    return 1
+  # Regra para permitir o tráfego de volta (conexões estabelecidas)
+  if ! iptables -C FORWARD -i "${VPN_IFACE}" -o "${LAN_IFACE}" -m state --state RELATED,ESTABLISHED -j ACCEPT &>/dev/null; then
+    iptables -A FORWARD -i "${VPN_IFACE}" -o "${LAN_IFACE}" -m state --state RELATED,ESTABLISHED -j ACCEPT
+  else
+    log "$C_YELLOW" "A regra de FORWARD (VPN -> LAN, established) já existe."
   fi
-  log_info "Backup salvo em: $BACKUP_FILE"
 
-  # Adiciona regras do iptables
-  log_info "Configurando regras do iptables..."
-
-  add_rule_if_not_exists "nat" "POSTROUTING" "-o $VPN_INTERFACE -j MASQUERADE" \
-    "Regra MASQUERADE na interface VPN"
-
-  add_rule_if_not_exists "filter" "FORWARD" "-i $LAN_INTERFACE -o $VPN_INTERFACE -j ACCEPT" \
-    "Regra FORWARD (LAN → VPN)"
-
-  add_rule_if_not_exists "filter" "FORWARD" "-i $VPN_INTERFACE -o $LAN_INTERFACE -m state --state RELATED,ESTABLISHED -j ACCEPT" \
-    "Regra FORWARD (VPN → LAN)"
-
-  echo "========================================"
-  log_info "ROTEAMENTO VPN ATIVADO COM SUCESSO!"
-  echo "========================================"
-
-  # Mostra informações úteis
-  echo ""
-  echo "PRÓXIMOS PASSOS:"
-  echo "1. Configure os dispositivos da rede para usar este computador como gateway"
-  echo "2. Configure rotas estáticas nos dispositivos para a rede do escritório"
-  echo ""
-  echo "Para verificar o status: sudo $0 status"
+  log "$C_GREEN" "Roteamento ativado com sucesso!"
+  log "$C_YELLOW" "Dispositivos na rede ${LAN_SUBNET} agora podem usar a VPN."
 }
 
-# Desativa o roteamento da VPN
+# Desativa o roteamento e remove as regras de firewall
 disable_routing() {
-  echo "========================================"
-  echo "DESATIVANDO ROTEAMENTO VPN"
-  echo "========================================"
+  log "$C_RED" "Desativando o compartilhamento de VPN..."
 
-  # Desabilita IP forwarding
-  log_info "Desabilitando IP forwarding..."
-  run_command "sysctl -w net.ipv4.ip_forward=0" "IP forwarding"
-
-  # Restaura regras do iptables
-  log_info "Restaurando regras originais do iptables..."
-
-  # Procura pelo backup mais recente
-  local latest_backup
-  latest_backup=$(find /tmp -name "iptables_before_vpn_routing_*.rules" -type f 2>/dev/null | sort -r | head -1)
-
-  if [[ -n "$latest_backup" && -f "$latest_backup" ]]; then
-    if iptables-restore <"$latest_backup"; then
-      log_info "Regras restauradas de: $latest_backup"
-      rm -f "$latest_backup"
-      log_debug "Arquivo de backup removido"
-    else
-      log_error "Falha ao restaurar regras do iptables"
-      log_error "Backup mantido em: $latest_backup"
-      return 1
-    fi
-  else
-    log_warn "Backup não encontrado. Tentando remoção manual das regras..."
-
-    # Remove regras específicas (pode falhar silenciosamente)
-    iptables -t nat -D POSTROUTING -o "$VPN_INTERFACE" -j MASQUERADE 2>/dev/null || true
-    iptables -D FORWARD -i "$LAN_INTERFACE" -o "$VPN_INTERFACE" -j ACCEPT 2>/dev/null || true
-    iptables -D FORWARD -i "$VPN_INTERFACE" -o "$LAN_INTERFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-
-    log_info "Tentativa de remoção manual concluída"
+  # 1. Remove as regras de firewall (na ordem inversa da adição)
+  log "$C_RED" "[1/3] Removendo regras de encaminhamento (FORWARD)..."
+  # -C (check) garante que só tentamos remover regras que existem, evitando erros
+  if iptables -C FORWARD -i "${VPN_IFACE}" -o "${LAN_IFACE}" -m state --state RELATED,ESTABLISHED -j ACCEPT &>/dev/null; then
+    iptables -D FORWARD -i "${VPN_IFACE}" -o "${LAN_IFACE}" -m state --state RELATED,ESTABLISHED -j ACCEPT
+  fi
+  if iptables -C FORWARD -i "${LAN_IFACE}" -o "${VPN_IFACE}" -j ACCEPT &>/dev/null; then
+    iptables -D FORWARD -i "${LAN_IFACE}" -o "${VPN_IFACE}" -j ACCEPT
   fi
 
-  echo "========================================"
-  log_info "ROTEAMENTO VPN DESATIVADO COM SUCESSO!"
-  echo "========================================"
+  # 2. Remove a regra de NAT
+  log "$C_RED" "[2/3] Removendo regra de NAT (MASQUERADE)..."
+  if iptables -t nat -C POSTROUTING -o "${VPN_IFACE}" -j MASQUERADE &>/dev/null; then
+    iptables -t nat -D POSTROUTING -o "${VPN_IFACE}" -j MASQUERADE
+  fi
+
+  # 3. Desativa o encaminhamento de IP no kernel
+  # Apenas desativamos se nenhum outro script precisar dele.
+  # É mais seguro deixar ativado se não tiver certeza. Para este uso, vamos desativar.
+  log "$C_RED" "[3/3] Desativando encaminhamento de IP (net.ipv4.ip_forward=0)..."
+  sysctl -w net.ipv4.ip_forward=0 >/dev/null
+
+  log "$C_GREEN" "Roteamento desativado e regras limpas com sucesso!"
+}
+
+# Mostra o status atual
+show_status() {
+  log "$C_BLUE" "Verificando status do roteamento VPN..."
+
+  # Verifica o encaminhamento de IP
+  local ip_forward
+  ip_forward=$(sysctl -n net.ipv4.ip_forward)
+  if [ "$ip_forward" -eq 1 ]; then
+    log "$C_GREEN" "Encaminhamento de IP está ATIVADO."
+  else
+    log "$C_RED" "Encaminhamento de IP está DESATIVADO."
+  fi
+
+  # Verifica as regras do iptables
+  log "$C_BLUE" "Verificando regras de iptables..."
+  local nat_rule_exists=false
+  local forward_lan_vpn_exists=false
+  local forward_vpn_lan_exists=false
+
+  if iptables -t nat -C POSTROUTING -o "${VPN_IFACE}" -j MASQUERADE &>/dev/null; then
+    nat_rule_exists=true
+    log "$C_GREEN" "-> Regra de NAT (MASQUERADE) para ${VPN_IFACE}: PRESENTE"
+  else
+    log "$C_YELLOW" "-> Regra de NAT (MASQUERADE) para ${VPN_IFACE}: AUSENTE"
+  fi
+
+  if iptables -C FORWARD -i "${LAN_IFACE}" -o "${VPN_IFACE}" -j ACCEPT &>/dev/null; then
+    forward_lan_vpn_exists=true
+    log "$C_GREEN" "-> Regra de FORWARD (${LAN_IFACE} -> ${VPN_IFACE}): PRESENTE"
+  else
+    log "$C_YELLOW" "-> Regra de FORWARD (${LAN_IFACE} -> ${VPN_IFACE}): AUSENTE"
+  fi
+
+  if iptables -C FORWARD -i "${VPN_IFACE}" -o "${LAN_IFACE}" -m state --state RELATED,ESTABLISHED -j ACCEPT &>/dev/null; then
+    forward_vpn_lan_exists=true
+    log "$C_GREEN" "-> Regra de FORWARD (Conexões estabelecidas): PRESENTE"
+  else
+    log "$C_YELLOW" "-> Regra de FORWARD (Conexões estabelecidas): AUSENTE"
+  fi
+
+  echo # Linha em branco para espaçamento
+
+  if $nat_rule_exists && $forward_lan_vpn_exists && $forward_vpn_lan_exists && [ "$ip_forward" -eq 1 ]; then
+    log "$C_GREEN" "Status Geral: ATIVO. O compartilhamento de VPN parece estar funcionando."
+  else
+    log "$C_RED" "Status Geral: INATIVO. O compartilhamento de VPN não está totalmente configurado."
+  fi
 }
 
 # ==============================================================================
 # FUNÇÃO PRINCIPAL
 # ==============================================================================
-
-# A função principal agora recebe os argumentos diretamente
 main() {
-  # Carrega configurações
-  load_config
-
-  # Verifica privilégios
   check_privileges
+  detect_subnet
 
-  # Processa argumentos
-  case "${1:-}" in
+  case "${1:-status}" in # O padrão é 'status' se nenhum argumento for passado
   enable)
     enable_routing
     ;;
